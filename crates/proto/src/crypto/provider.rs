@@ -10,7 +10,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use subtle::ConstantTimeEq;
 
@@ -138,6 +138,38 @@ impl fmt::Display for DtlsVersion {
     }
 }
 
+/// Retransmission behavior for a DTLS handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtlsRetransmissionConfig {
+    /// Initial retransmission timeout for each handshake flight.
+    pub initial_rto: Duration,
+    /// Maximum number of retransmissions for each handshake flight.
+    pub max_retries: usize,
+    /// Maximum duration of the entire handshake.
+    pub handshake_timeout: Duration,
+}
+
+/// Options used when creating a DTLS instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtlsOptions {
+    /// DTLS protocol version selection.
+    pub version: DtlsVersion,
+    /// Packet-size hint for providers that can size their record layer.
+    pub mtu: Option<usize>,
+    /// Optional handshake retransmission configuration.
+    pub retransmission: Option<DtlsRetransmissionConfig>,
+}
+
+impl Default for DtlsOptions {
+    fn default() -> Self {
+        Self {
+            version: DtlsVersion::default(),
+            mtu: None,
+            retransmission: None,
+        }
+    }
+}
+
 /// Factory for DTLS instances and certificates.
 pub trait DtlsProvider: CryptoSafe {
     /// Generate a new self-signed DTLS certificate.
@@ -157,6 +189,25 @@ pub trait DtlsProvider: CryptoSafe {
         dtls_version: DtlsVersion,
         mtu: Option<usize>,
     ) -> Result<Box<dyn DtlsInstance>, CryptoError>;
+
+    /// Create a DTLS instance with extended provider-neutral options.
+    ///
+    /// Providers that do not support custom retransmission behavior return an
+    /// error rather than silently ignoring it.
+    fn new_dtls_with_options(
+        &self,
+        cert: &DtlsCert,
+        now: Instant,
+        options: DtlsOptions,
+    ) -> Result<Box<dyn DtlsInstance>, CryptoError> {
+        if options.retransmission.is_some() {
+            return Err(CryptoError::Other(
+                "Custom DTLS retransmission configuration is not supported by this provider".into(),
+            ));
+        }
+
+        self.new_dtls(cert, now, options.version, options.mtu)
+    }
 
     /// Whether the provider is used in a test context.
     fn is_test(&self) -> bool {

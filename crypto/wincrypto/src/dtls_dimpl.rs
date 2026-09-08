@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use str0m_proto::crypto::CryptoError;
-use str0m_proto::crypto::DtlsVersion;
 use str0m_proto::crypto::dtls::ProtocolVersion;
 use str0m_proto::crypto::dtls::{DtlsCert, DtlsImplError, DtlsInstance, DtlsOutput, DtlsProvider};
+use str0m_proto::crypto::{DtlsOptions, DtlsVersion};
 
 use dimpl::{Config, Dtls, DtlsCertificate};
 
@@ -16,6 +16,28 @@ use dimpl::{Config, Dtls, DtlsCertificate};
 
 #[derive(Debug)]
 pub(crate) struct WinCryptoDtlsProvider;
+
+fn build_config(options: DtlsOptions, is_test: bool) -> Result<Config, CryptoError> {
+    // ICE verifies return routability before DTLS, making server cookies redundant.
+    let mut builder = Config::builder().use_server_cookie(false);
+    if let Some(mtu) = options.mtu {
+        builder = builder.mtu(mtu);
+    }
+    if let Some(retransmission) = options.retransmission {
+        builder = builder
+            .flight_start_rto(retransmission.initial_rto)
+            .flight_retries(retransmission.max_retries)
+            .handshake_timeout(retransmission.handshake_timeout);
+    }
+    if is_test {
+        builder = builder.dangerously_set_rng_seed(42);
+    }
+
+    builder
+        .with_crypto_provider(crate::dimpl_provider::default_provider())
+        .build()
+        .map_err(|e| CryptoError::Other(format!("dimpl config creation failed: {e}")))
+}
 
 impl DtlsProvider for WinCryptoDtlsProvider {
     fn generate_certificate(&self) -> Option<DtlsCert> {
@@ -29,38 +51,102 @@ impl DtlsProvider for WinCryptoDtlsProvider {
         dtls_version: DtlsVersion,
         mtu: Option<usize>,
     ) -> Result<Box<dyn DtlsInstance>, CryptoError> {
+        self.new_dtls_with_options(
+            cert,
+            now,
+            DtlsOptions {
+                version: dtls_version,
+                mtu,
+                retransmission: None,
+            },
+        )
+    }
+
+    fn new_dtls_with_options(
+        &self,
+        cert: &DtlsCert,
+        now: Instant,
+        options: DtlsOptions,
+    ) -> Result<Box<dyn DtlsInstance>, CryptoError> {
         let dimpl_cert = DtlsCertificate {
             certificate: cert.certificate.clone(),
             private_key: cert.private_key.clone(),
         };
 
-        // ICE verifies return routability before DTLS, making server cookies redundant.
-        let mut builder = Config::builder().use_server_cookie(false);
-        if let Some(mtu) = mtu {
-            builder = builder.mtu(mtu);
-        }
-        if self.is_test() {
-            builder = builder.dangerously_set_rng_seed(42);
-        }
-
-        let config = builder
-            .with_crypto_provider(crate::dimpl_provider::default_provider())
-            .build()
-            .map_err(|e| CryptoError::Other(format!("dimpl config creation failed: {e}")))?;
-
-        let config = Arc::new(config);
-        let dtls = match dtls_version {
+        let config = Arc::new(build_config(options, self.is_test())?);
+        let dtls = match options.version {
             DtlsVersion::Dtls12 => Dtls::new_12(config, dimpl_cert, now),
             DtlsVersion::Dtls13 => Dtls::new_13(config, dimpl_cert, now),
             DtlsVersion::Auto => Dtls::new_auto(config, dimpl_cert, now),
             _ => {
                 return Err(CryptoError::Other(format!(
-                    "Unsupported DTLS version: {dtls_version}"
+                    "Unsupported DTLS version: {}",
+                    options.version
                 )));
             }
         };
 
         Ok(Box::new(WinCryptoDtlsInstance { dtls }))
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use std::time::{Duration, Instant};
+
+    use str0m_proto::crypto::{DtlsOptions, DtlsRetransmissionConfig, DtlsVersion};
+
+    use super::build_config;
+
+    fn custom_options() -> DtlsOptions {
+        DtlsOptions {
+            version: DtlsVersion::Dtls12,
+            mtu: Some(1200),
+            retransmission: Some(DtlsRetransmissionConfig {
+                initial_rto: Duration::from_millis(400),
+                max_retries: 8,
+                handshake_timeout: Duration::from_secs(40),
+            }),
+        }
+    }
+
+    #[test]
+    fn applies_custom_retransmission_options() {
+        let config = build_config(custom_options(), true).expect("valid Dimpl configuration");
+
+        assert_eq!(config.flight_start_rto(), Duration::from_millis(400));
+        assert_eq!(config.flight_retries(), 8);
+        assert_eq!(config.handshake_timeout(), Duration::from_secs(40));
+    }
+
+    #[test]
+    fn creates_dtls_through_public_provider_options_api() {
+        let provider = crate::default_provider();
+        let certificate = provider
+            .dtls_provider
+            .generate_certificate()
+            .expect("self-signed certificate");
+
+        provider
+            .dtls_provider
+            .new_dtls_with_options(&certificate, Instant::now(), custom_options())
+            .expect("DTLS instance with custom retransmission options");
+    }
+
+    #[test]
+    fn creates_auto_dtls_with_custom_retransmission_options() {
+        let provider = crate::default_provider();
+        let certificate = provider
+            .dtls_provider
+            .generate_certificate()
+            .expect("self-signed certificate");
+        let mut options = custom_options();
+        options.version = DtlsVersion::Auto;
+
+        provider
+            .dtls_provider
+            .new_dtls_with_options(&certificate, Instant::now(), options)
+            .expect("Auto DTLS instance with custom retransmission options");
     }
 }
 
