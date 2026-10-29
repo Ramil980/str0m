@@ -66,6 +66,9 @@ pub(crate) const PT_G722_RED: Pt = Pt::new_with_value(62);
 pub(crate) const PT_PCMU_RED: Pt = Pt::new_with_value(61);
 pub(crate) const PT_PCMA_RED: Pt = Pt::new_with_value(60);
 
+/// Default payload type for AMR-WB.
+pub(crate) const PT_AMR_WB: Pt = Pt::new_with_value(122);
+
 /// Session config for all codecs.
 #[derive(Debug, Clone, Default)]
 pub struct CodecConfig {
@@ -115,7 +118,8 @@ impl CodecConfig {
         self.params.clear();
     }
 
-    /// Manually configure a payload type.
+    /// Manually configure a payload type. For telephone events, configure one
+    /// payload type per supported RTP clock rate; no rates are added automatically.
     pub fn add_config(
         &mut self,
         pt: Pt,
@@ -272,6 +276,25 @@ impl CodecConfig {
             return;
         }
         self.add_static_config(PT_COMFORT_NOISE);
+    }
+
+    /// Add a default AMR-WB payload type.
+    pub fn enable_amr_wb(&mut self, enabled: bool) {
+        self.params.retain(|c| c.spec.codec != Codec::AmrWb);
+        if !enabled {
+            return;
+        }
+        self.add_config(
+            PT_AMR_WB,
+            None,
+            Codec::AmrWb,
+            Frequency::SIXTEEN_KHZ,
+            Some(1),
+            FormatParams {
+                octet_align: Some(true),
+                ..Default::default()
+            },
+        );
     }
 
     /// Add a default OPUS payload type, optionally with RFC 2198 RED.
@@ -532,14 +555,51 @@ impl CodecConfig {
         self.params.iter().find(move |p| f(p))
     }
 
-    pub(crate) fn all_for_kind(&self, kind: MediaKind) -> impl Iterator<Item = &PayloadParams> {
-        self.params.iter().filter(move |params| {
+    /// Return configured payloads for a media kind, optionally preferring event
+    /// clock rates that match audio codecs in a new local offer.
+    pub(crate) fn all_for_kind(
+        &self,
+        kind: MediaKind,
+        for_new_offer: bool,
+    ) -> impl Iterator<Item = &PayloadParams> {
+        let matches_audio_clock = move |event: &PayloadParams| {
+            self.params.iter().any(|audio| {
+                audio.spec.codec.is_audio()
+                    && audio.spec.rtp_clock_rate() == event.spec.rtp_clock_rate()
+            })
+        };
+        let has_matching_events = self
+            .params
+            .iter()
+            .any(|p| p.spec.codec.is_tele() && matches_audio_clock(p));
+
+        self.params.iter().filter(move |p| {
             if kind == MediaKind::Video {
-                params.spec.codec.is_video()
+                p.spec.codec.is_video()
             } else {
-                params.spec.codec.is_audio()
+                p.spec.codec.is_audio()
+                    || (p.spec.codec.is_tele()
+                        && (!for_new_offer || !has_matching_events || matches_audio_clock(p)))
             }
         })
+    }
+
+    /// Highest telephone-event code for this payload type.
+    ///
+    /// Before SDP negotiation this is the configured range (default `0-16`).
+    /// After negotiation it is the smaller range advertised by both peers,
+    /// shared across all m-lines using the payload type. Returns `None` if
+    /// the payload type is not configured as telephone-event.
+    pub(crate) fn tele_event_max(&self, pt: Pt) -> Option<u8> {
+        self.params
+            .iter()
+            .find(|p| p.pt() == pt && p.spec.codec.is_tele())
+            .map(|p| {
+                p.spec
+                    .format
+                    .telephone_event_max
+                    .unwrap_or(FormatParams::DEFAULT_TELEPHONE_EVENT_MAX)
+            })
     }
 
     pub(crate) fn update_params(&mut self, remote_params: &[PayloadParams], remote_dir: Direction) {
@@ -700,6 +760,26 @@ mod test {
 
     use super::*;
     use crate::format::{CodecSpec, FormatParams};
+
+    #[test]
+    fn transport_cc_uses_first_section_and_preserves_local_capability() {
+        for direction in [Direction::SendOnly, Direction::RecvOnly] {
+            for local_enabled in [false, true] {
+                for sections in [[false, false], [false, true], [true, false]] {
+                    let mut config = CodecConfig::empty();
+                    config.enable_vp8(true);
+                    config.params[0].set_fb_transport_cc(local_enabled);
+                    let mut remote = config.params[0];
+                    let expected = local_enabled && sections[0];
+                    for enabled in sections {
+                        remote.set_fb_transport_cc(enabled);
+                        config.update_params(&[remote], direction);
+                        assert_eq!(config.params()[0].fb_transport_cc(), expected);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn static_payload_types_have_canonical_codec_definitions() {
@@ -901,6 +981,30 @@ mod test {
             for b in &pts[i + 1..] {
                 assert_ne!(a, b, "RED payload types must be distinct");
             }
+        }
+    }
+
+    #[test]
+    fn enable_amr_wb_uses_a_free_default_pt() {
+        let mut config = CodecConfig::new_with_defaults();
+
+        config.enable_amr_wb(true);
+
+        let amr_wb = config
+            .params()
+            .iter()
+            .find(|p| p.spec().codec == Codec::AmrWb)
+            .expect("AMR-WB should be enabled");
+        assert_eq!(amr_wb.pt(), PT_AMR_WB);
+
+        let mut seen = std::collections::HashSet::new();
+        for pt in config
+            .params()
+            .iter()
+            .flat_map(|p| [Some(p.pt()), p.resend(), p.red()])
+            .flatten()
+        {
+            assert!(seen.insert(pt), "duplicate PT {pt}");
         }
     }
 
@@ -1258,7 +1362,7 @@ mod test {
 
         // Now simulate creating a new video m-line (for Firefox's camera)
         // This is where the bug manifests: we collect ALL video codecs from config
-        let all_video_params: Vec<_> = config.all_for_kind(MediaKind::Video).collect();
+        let all_video_params: Vec<_> = config.all_for_kind(MediaKind::Video, false).collect();
 
         // Extract just the PTs (including RTX PTs)
         let mut all_pts = Vec::new();

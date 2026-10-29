@@ -944,6 +944,7 @@ impl IceAgent {
                 && v.base() == c.base()
                 && v.raddr() == c.raddr()
                 && v.kind() == c.kind()
+                && v.proto() == c.proto()
         }) {
             if !other.discarded() {
                 debug!("Local candidate to discard {:?}", Pii(&other));
@@ -962,6 +963,7 @@ impl IceAgent {
                     && v.base() == c.base()
                     && v.raddr() == c.raddr()
                     && v.kind() == c.kind()
+                    && v.proto() == c.proto()
             })
         {
             if !other.discarded() {
@@ -1600,6 +1602,28 @@ impl IceAgent {
 
         pair.increase_remote_binding_requests(req.now);
 
+        if self.ice_lite && !self.controlling {
+            // ice-lite sends no checks of its own, so this pair can never be
+            // promoted by a binding response and stays `Waiting` for its
+            // whole life. `has_viable_remote_candidate` therefore never
+            // reports the remote, and `Rtc::accepts` refuses the peer's
+            // non-STUN traffic until nomination has given us a send address.
+            //
+            // An answered binding request is not return-routability proof
+            // the way a binding *response* is, and this does not claim to
+            // be. It is the only validation an ice-lite agent can ever
+            // have, and for a controlled agent it grants strictly less
+            // than an attacker already has: a forged USE-CANDIDATE request
+            // already reaches `pair.nominate()` below and redirects
+            // egress, while this only lets ingress reach DTLS/SRTP.
+            //
+            // A *controlling* ice-lite agent is left alone: there,
+            // `CheckState::Succeeded` feeds `evaluate_nomination()` just
+            // below, so promoting a pair here would let one forged request
+            // with a high PRIORITY choose the send address.
+            pair.record_remote_binding_request_success();
+        }
+
         if !self.controlling && !pair.is_nominated() && req.use_candidate {
             // We need to answer a nomination request with a binding request
             // in the other direction.
@@ -1888,9 +1912,8 @@ impl IceAgent {
 
         pair.record_binding_response(now, trans_id, valid_idx);
 
-        if self.controlling {
-            self.evaluate_nomination();
-        }
+        // For a controlled agent, a successful check can make a nominated pair valid.
+        self.evaluate_nomination();
 
         // State might change when we get a response.
         self.evaluate_state(now);
@@ -1908,10 +1931,13 @@ impl IceAgent {
                 .max_by_key(|p| p.prio())
         } else {
             // For controlled agents, we pick the best pair from what the controlling
-            // agent has indicated with USE-CANDIDATE stun attribute.
+            // agent has indicated with USE-CANDIDATE stun attribute. RFC 8445 §7.3.1.5
+            // lets us act on a nomination only once the pair is valid, i.e. our own
+            // check on it succeeded, so a pair the peer nominated but we cannot reach
+            // never becomes the send path.
             self.candidate_pairs
                 .iter_mut()
-                .filter(|p| p.is_nominated())
+                .filter(|p| p.is_nominated() && p.state() == CheckState::Succeeded)
                 .max_by_key(|p| p.prio())
         };
 
@@ -2014,7 +2040,10 @@ impl IceAgent {
         let mut any_still_possible = false;
 
         for p in &self.candidate_pairs {
-            if p.is_nominated() {
+            // A nominated pair counts once it is valid (RFC 8445 §8.1.1), which is
+            // also when `evaluate_nomination` can make it the send path. Until then
+            // it is just another pair being checked.
+            if p.is_nominated() && p.state() == CheckState::Succeeded {
                 any_nomination = true;
             } else if p.is_still_possible(now, &self.timing_config) {
                 any_still_possible = true;
@@ -2184,6 +2213,63 @@ mod test {
     }
 
     #[test]
+    fn does_not_invalidate_local_candidate_with_same_ip_but_different_protocol() {
+        let mut agent = new_test_agent();
+        let udp = Candidate::host(ipv4_1(), "udp").unwrap();
+        let tcp = Candidate::host(ipv4_1(), "tcp").unwrap();
+
+        agent.add_local_candidate(udp.clone()).unwrap();
+        agent.add_local_candidate(tcp.clone()).unwrap();
+
+        let invalidated = agent.invalidate_candidate(&tcp);
+        assert!(invalidated);
+
+        let udp_discarded = agent
+            .local_candidates
+            .iter()
+            .find(|v| {
+                v.addr() == udp.addr()
+                    && v.base() == udp.base()
+                    && v.raddr() == udp.raddr()
+                    && v.kind() == udp.kind()
+                    && v.proto() == udp.proto()
+            })
+            .unwrap()
+            .discarded();
+        assert!(!udp_discarded);
+
+        let tcp_discarded = agent
+            .local_candidates
+            .iter()
+            .find(|v| {
+                v.addr() == tcp.addr()
+                    && v.base() == tcp.base()
+                    && v.raddr() == tcp.raddr()
+                    && v.kind() == tcp.kind()
+                    && v.proto() == tcp.proto()
+            })
+            .unwrap()
+            .discarded();
+        assert!(tcp_discarded);
+
+        let invalidated = agent.invalidate_candidate(&udp);
+        assert!(invalidated);
+        let udp_discarded = agent
+            .local_candidates
+            .iter()
+            .find(|v| {
+                v.addr() == udp.addr()
+                    && v.base() == udp.base()
+                    && v.raddr() == udp.raddr()
+                    && v.kind() == udp.kind()
+                    && v.proto() == udp.proto()
+            })
+            .unwrap()
+            .discarded();
+        assert!(udp_discarded);
+    }
+
+    #[test]
     fn does_not_invalidate_remote_candidate_with_same_ip_but_different_kind() {
         let mut agent = new_test_agent();
         let host = Candidate::host(ipv4_1(), "udp").unwrap();
@@ -2196,6 +2282,63 @@ mod test {
 
         let invalidated = agent.invalidate_candidate(&host);
         assert!(invalidated);
+    }
+
+    #[test]
+    fn does_not_invalidate_remote_candidate_with_same_ip_but_different_protocol() {
+        let mut agent = new_test_agent();
+        let udp = Candidate::host(ipv4_1(), "udp").unwrap();
+        let tcp = Candidate::host(ipv4_1(), "tcp").unwrap();
+
+        agent.add_remote_candidate(udp.clone());
+        agent.add_remote_candidate(tcp.clone());
+
+        let invalidated = agent.invalidate_candidate(&tcp);
+        assert!(invalidated);
+
+        let udp_discarded = agent
+            .remote_candidates
+            .iter()
+            .find(|v| {
+                v.addr() == udp.addr()
+                    && v.base() == udp.base()
+                    && v.raddr() == udp.raddr()
+                    && v.kind() == udp.kind()
+                    && v.proto() == udp.proto()
+            })
+            .unwrap()
+            .discarded();
+        assert!(!udp_discarded);
+
+        let tcp_discarded = agent
+            .remote_candidates
+            .iter()
+            .find(|v| {
+                v.addr() == tcp.addr()
+                    && v.base() == tcp.base()
+                    && v.raddr() == tcp.raddr()
+                    && v.kind() == tcp.kind()
+                    && v.proto() == tcp.proto()
+            })
+            .unwrap()
+            .discarded();
+        assert!(tcp_discarded);
+
+        let invalidated = agent.invalidate_candidate(&udp);
+        assert!(invalidated);
+        let udp_discarded = agent
+            .remote_candidates
+            .iter()
+            .find(|v| {
+                v.addr() == udp.addr()
+                    && v.base() == udp.base()
+                    && v.raddr() == udp.raddr()
+                    && v.kind() == udp.kind()
+                    && v.proto() == udp.proto()
+            })
+            .unwrap()
+            .discarded();
+        assert!(udp_discarded);
     }
 
     #[test]
@@ -2666,6 +2809,242 @@ mod test {
         agent.invalidate_candidate(&host1);
 
         assert_eq!(agent.remote_candidates().collect::<Vec<_>>(), vec![host2]);
+    }
+
+    #[test]
+    fn ice_lite_remote_candidate_viable_after_binding_request() {
+        let mut agent = new_test_agent();
+        agent.set_ice_lite(true);
+        agent.set_controlling(false);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let remote_creds = IceCreds::new();
+        agent.set_remote_credentials(remote_creds.clone());
+
+        let mut remote_candidate = Candidate::host(ipv4_3(), "udp").unwrap();
+        remote_candidate.set_ufrag(&remote_creds.ufrag);
+        let prio = remote_candidate.prio();
+        agent.add_remote_candidate(remote_candidate);
+
+        // Nothing has been heard from the remote yet.
+        assert!(!agent.has_viable_remote_candidate(ipv4_3()));
+
+        let serialized_req = make_serialized_binding_request(
+            &agent.local_credentials,
+            &remote_creds,
+            true, // the remote is the controlling agent
+            prio,
+        );
+        let binding_req = StunMessage::parse(&serialized_req).unwrap();
+
+        let now = Instant::now();
+        assert!(agent.handle_packet(
+            now,
+            StunPacket {
+                message: binding_req,
+                source: ipv4_3(),
+                destination: ipv4_1(),
+                proto: Protocol::Udp,
+            },
+        ));
+
+        // We answered a binding request whose integrity checked out against our
+        // local password. An ice-lite agent sends no checks of its own, so this
+        // is the only validation the pair will ever get, and it must be enough
+        // for the remote address to count as viable.
+        assert!(agent.has_viable_remote_candidate(ipv4_3()));
+    }
+
+    #[test]
+    fn ice_lite_validation_survives_trickle() {
+        let mut agent = new_test_agent();
+        agent.set_ice_lite(true);
+        agent.set_controlling(false);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+        let remote_creds = IceCreds::new();
+        agent.set_remote_credentials(remote_creds.clone());
+        // Receive a check before the remote host candidate is signaled.
+        let remote = Candidate::host(ipv4_3(), "udp").unwrap();
+        let serialized = make_serialized_binding_request(
+            &agent.local_credentials,
+            &remote_creds,
+            true,
+            remote.prio() - 1,
+        );
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                message: StunMessage::parse(&serialized).unwrap(),
+                source: ipv4_3(),
+                destination: ipv4_1(),
+                proto: Protocol::Udp,
+            }
+        ));
+        assert!(agent.has_viable_remote_candidate(ipv4_3()));
+        // The higher-priority signaled candidate replaces the peer-reflexive pair.
+        agent.add_remote_candidate(remote);
+        assert!(
+            agent.has_viable_remote_candidate(ipv4_3()),
+            "trickling the real candidate must retain validated ingress"
+        );
+    }
+
+    #[test]
+    fn ice_lite_controlling_does_not_nominate_on_a_binding_request() {
+        // The controlled case above is the supported one. A *controlling*
+        // ice-lite agent must not be promoted the same way: there,
+        // `CheckState::Succeeded` feeds `evaluate_nomination`, so one
+        // request — whose PRIORITY the sender chooses — would pick the
+        // send address without any return-routability proof.
+        let mut agent = new_test_agent();
+        agent.set_ice_lite(true);
+        agent.set_controlling(true);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let remote_creds = IceCreds::new();
+        agent.set_remote_credentials(remote_creds.clone());
+
+        let mut remote_candidate = Candidate::host(ipv4_3(), "udp").unwrap();
+        remote_candidate.set_ufrag(&remote_creds.ufrag);
+        let prio = remote_candidate.prio();
+        agent.add_remote_candidate(remote_candidate);
+
+        let serialized_req = make_serialized_binding_request(
+            &agent.local_credentials,
+            &remote_creds,
+            false, // we are the controlling agent
+            prio,
+        );
+        let binding_req = StunMessage::parse(&serialized_req).unwrap();
+
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                message: binding_req,
+                source: ipv4_3(),
+                destination: ipv4_1(),
+                proto: Protocol::Udp,
+            },
+        ));
+
+        assert!(!agent.has_viable_remote_candidate(ipv4_3()));
+        assert!(
+            !agent
+                .events
+                .iter()
+                .any(|e| matches!(e, IceAgentEvent::NominatedSend { .. })),
+            "a single binding request must not choose the send address"
+        );
+    }
+
+    #[test]
+    fn controlled_sends_only_on_a_nominated_pair_whose_check_succeeded() {
+        // RFC 8445 §7.3.1.5: the controlled agent acts on USE-CANDIDATE only
+        // for a pair that is, or becomes, valid. Here the peer nominates the
+        // highest-priority pair first, but our checks on it are never
+        // answered (one-way connectivity). It then nominates a lower-priority
+        // pair whose check succeeds. Media must go to the second pair.
+        let mut agent = new_test_agent();
+        agent.set_controlling(false);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let remote_creds = IceCreds::new();
+        agent.set_remote_credentials(remote_creds.clone());
+
+        let mut dead =
+            Candidate::from_sdp_string("candidate:1 1 udp 2130706431 3.4.5.6 5000 typ host")
+                .unwrap();
+        dead.set_ufrag(&remote_creds.ufrag);
+        let mut alive =
+            Candidate::from_sdp_string("candidate:2 1 udp 1694498815 4.5.6.7 5000 typ host")
+                .unwrap();
+        alive.set_ufrag(&remote_creds.ufrag);
+        let (dead_prio, alive_prio) = (dead.prio(), alive.prio());
+        assert!(dead_prio > alive_prio);
+        agent.add_remote_candidate(dead);
+        agent.add_remote_candidate(alive);
+
+        let nominate = |agent: &mut IceAgent, now: Instant, source: SocketAddr, prio: u32| {
+            let username = format!("{}:{}", agent.local_credentials.ufrag, remote_creds.ufrag);
+            let req = StunMessage::binding_request(&username, TransId::new(), true, 0, prio, true);
+            let req = serialize_stun_msg(req, &agent.local_credentials.pass);
+            assert!(agent.handle_packet(
+                now,
+                StunPacket {
+                    message: StunMessage::parse(&req).unwrap(),
+                    source,
+                    destination: ipv4_1(),
+                    proto: Protocol::Udp,
+                },
+            ));
+        };
+
+        // Answer our checks toward `alive` only; drop everything else.
+        let answer_alive = |agent: &mut IceAgent, now: Instant| {
+            let mut replies = vec![];
+            while let Some(t) = agent.poll_transmit() {
+                let msg = StunMessage::parse(&t.contents).unwrap();
+                if t.destination == ipv4_4() && msg.is_binding_request() {
+                    replies.push(make_authenticated_stun_reply(
+                        msg.trans_id(),
+                        ipv4_1(),
+                        &remote_creds.pass,
+                    ));
+                }
+            }
+            for reply in replies {
+                agent.handle_packet(
+                    now,
+                    StunPacket {
+                        message: StunMessage::parse(&reply).unwrap(),
+                        source: ipv4_4(),
+                        destination: ipv4_1(),
+                        proto: Protocol::Udp,
+                    },
+                );
+            }
+        };
+
+        let nominated_sends = |agent: &mut IceAgent| {
+            let mut v = vec![];
+            while let Some(e) = agent.poll_event() {
+                if let IceAgentEvent::NominatedSend { destination, .. } = e {
+                    v.push(destination);
+                }
+            }
+            v
+        };
+
+        let mut now = Instant::now();
+        agent.handle_timeout(now);
+
+        nominate(&mut agent, now, ipv4_3(), dead_prio);
+        for _ in 0..20 {
+            answer_alive(&mut agent, now);
+            now += Duration::from_millis(50);
+            agent.handle_timeout(now);
+        }
+        assert_eq!(
+            nominated_sends(&mut agent),
+            vec![],
+            "a nominated pair whose check has not succeeded must not be used"
+        );
+
+        nominate(&mut agent, now, ipv4_4(), alive_prio);
+        for _ in 0..20 {
+            answer_alive(&mut agent, now);
+            now += Duration::from_millis(50);
+            agent.handle_timeout(now);
+        }
+        assert_eq!(nominated_sends(&mut agent), vec![ipv4_4()]);
     }
 
     fn make_serialized_binding_request(

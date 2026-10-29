@@ -13,10 +13,9 @@ use openssl::ssl::{SslOptions, SslStream, SslVerifyMode};
 use openssl::x509::X509;
 
 use str0m_proto::DATAGRAM_MTU_TARGET;
-use str0m_proto::crypto::dtls::{
-    DtlsCert, DtlsCryptoError, DtlsCryptoOperation, KeyingMaterial, ProtocolVersion, SrtpProfile,
-};
+use str0m_proto::crypto::dtls::{DtlsCert, DtlsCryptoError, DtlsCryptoOperation};
 use str0m_proto::crypto::dtls::{DtlsImplError, DtlsInstance, DtlsOutput, DtlsProvider};
+use str0m_proto::crypto::dtls::{KeyingMaterial, ProtocolVersion, SrtpProfile};
 use str0m_proto::crypto::{CryptoError, DtlsVersion};
 
 // ============================================================================
@@ -631,11 +630,11 @@ impl DtlsInstance for OsslDtlsInstance {
         Ok(())
     }
 
-    fn send_application_data(&mut self, data: &[u8]) -> Result<(), DtlsImplError> {
+    fn send_application_data(&mut self, data: &[u8]) -> Result<usize, DtlsImplError> {
         // If handshake not complete, queue for later
         if !self.inner.is_connected() {
             self.queued_app_data.push_back(data.to_vec());
-            return Ok(());
+            return Ok(data.len());
         }
 
         // Flush any queued data first
@@ -647,7 +646,7 @@ impl DtlsInstance for OsslDtlsInstance {
         }
 
         self.collect_output();
-        Ok(())
+        Ok(data.len())
     }
 
     fn is_active(&self) -> bool {

@@ -44,7 +44,7 @@ impl CodecSpec {
     }
 }
 
-/// Known codecs.
+/// Known codecs and RTP payload formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[allow(missing_docs)]
@@ -55,6 +55,7 @@ pub enum Codec {
     G722,
     /// Comfort Noise payload, per RFC 3389.
     CN,
+    AmrWb,
     H264,
     // TODO show this when we support h265.
     #[doc(hidden)]
@@ -66,6 +67,19 @@ pub enum Codec {
     // TODO show this when we support Av1.
     #[doc(hidden)]
     Av1,
+    /// Telephone events (DTMF) RTP payload, per RFC 4733.
+    ///
+    /// Negotiated alongside audio on the same SDP m-line. See
+    /// [`CodecConfig::add_config`][super::CodecConfig::add_config] for explicit
+    /// payload configuration, offer clock-rate preferences and fallbacks.
+    ///
+    /// Targets libwebrtc-compatible DTMF, defaulting to events `0-16`, not full
+    /// RFC 4733 event handling. Only `0-X` SDP ranges are supported.
+    ///
+    /// Frame mode uses [`Writer::telephone_event`][crate::media::Writer::telephone_event]
+    /// and [`CodecExtra::Tele`][super::CodecExtra::Tele]. For RTP mode, see
+    /// [`TelephoneEvent`][crate::media::TelephoneEvent].
+    Tele,
     /// Technically not a codec, but used in places where codecs go
     /// in `a=rtpmap` lines.
     #[doc(hidden)]
@@ -88,7 +102,7 @@ impl Codec {
     /// Tells if codec is audio.
     pub fn is_audio(&self) -> bool {
         use Codec::*;
-        matches!(self, Opus | PCMU | PCMA | G722 | CN)
+        matches!(self, Opus | PCMU | PCMA | G722 | CN | AmrWb)
     }
 
     /// Tells if codec is video.
@@ -97,9 +111,14 @@ impl Codec {
         matches!(self, H266 | H265 | H264 | Vp8 | Vp9 | Av1)
     }
 
+    /// Tells if this is the telephone-event RTP payload format.
+    pub fn is_tele(&self) -> bool {
+        *self == Codec::Tele
+    }
+
     /// Audio/Video.
     pub fn kind(&self) -> MediaKind {
-        if self.is_audio() {
+        if self.is_audio() || self.is_tele() {
             MediaKind::Audio
         } else {
             MediaKind::Video
@@ -116,12 +135,14 @@ impl<'a> From<&'a str> for Codec {
             "pcma" => Codec::PCMA,
             "g722" => Codec::G722,
             "cn" => Codec::CN,
+            "amr-wb" => Codec::AmrWb,
             "h264" => Codec::H264,
             "h265" => Codec::H265,
             "h266" => Codec::H266,
             "vp8" => Codec::Vp8,
             "vp9" => Codec::Vp9,
             "av1" => Codec::Av1,
+            "telephone-event" => Codec::Tele,
             "rtx" => Codec::Rtx, // resends
             "red" => Codec::Red, // RFC 2198 redundancy
             _ => Codec::Unknown,
@@ -137,12 +158,14 @@ impl fmt::Display for Codec {
             Codec::PCMA => write!(f, "PCMA"),
             Codec::G722 => write!(f, "G722"),
             Codec::CN => write!(f, "CN"),
+            Codec::AmrWb => write!(f, "AMR-WB"),
             Codec::H264 => write!(f, "H264"),
             Codec::H265 => write!(f, "H265"),
             Codec::H266 => write!(f, "H266"),
             Codec::Vp8 => write!(f, "VP8"),
             Codec::Vp9 => write!(f, "VP9"),
             Codec::Av1 => write!(f, "AV1"),
+            Codec::Tele => write!(f, "telephone-event"),
             Codec::Rtx => write!(f, "rtx"),
             Codec::Red => write!(f, "red"),
             Codec::Null => write!(f, "null"),
@@ -182,6 +205,16 @@ mod test {
         assert_eq!(Codec::from("CN"), Codec::CN);
         assert_eq!(Codec::from("cn"), Codec::CN);
         assert_eq!(Codec::CN.to_string(), "CN");
+    }
+
+    #[test]
+    fn telephone_event_payload() {
+        assert_eq!(Codec::from("telephone-event"), Codec::Tele);
+        assert_eq!(Codec::from("TELEPHONE-EVENT"), Codec::Tele);
+        assert_eq!(Codec::Tele.to_string(), "telephone-event");
+        assert_eq!(Codec::Tele.kind(), MediaKind::Audio);
+        assert!(!Codec::Tele.is_audio());
+        assert!(!Codec::Tele.is_video());
     }
 
     #[test]

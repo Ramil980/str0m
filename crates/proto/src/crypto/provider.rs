@@ -2,7 +2,7 @@
 //!
 //! This module defines the trait-based interface for cryptographic operations
 //! in str0m, allowing users to provide custom crypto implementations for SRTP,
-//! SHA1 HMAC (for STUN), and DTLS.
+//! SHA-1 and SHA-256 hashing, SHA1 HMAC (for STUN), and DTLS.
 //!
 //! Implementors of a crypto provider only need to depend on this module.
 
@@ -21,7 +21,7 @@ use crate::crypto::error::CryptoError;
 // CryptoProvider
 // ============================================================================
 
-/// Cryptographic provider for SRTP, SHA1 HMAC, and DTLS operations.
+/// Cryptographic provider for SRTP, hashing, SHA1 HMAC, and DTLS operations.
 ///
 /// This struct holds references to all cryptographic components needed
 /// for WebRTC operations. Users can provide custom implementations of each component
@@ -38,6 +38,8 @@ pub struct CryptoProvider {
     pub srtp_provider: &'static dyn SrtpProvider,
     /// SHA1 HMAC provider for STUN message integrity.
     pub sha1_hmac_provider: &'static dyn Sha1HmacProvider,
+    /// SHA-1 hash provider for legacy certificate fingerprints.
+    pub sha1_provider: &'static dyn Sha1Provider,
     /// SHA-256 hash provider.
     pub sha256_provider: &'static dyn Sha256Provider,
     /// DTLS provider for creating DTLS instances.
@@ -107,6 +109,12 @@ pub trait SrtpProvider: CryptoSafe {
 
     /// Perform AES-256-ECB round for key derivation.
     fn srtp_aes_256_ecb_round(&self, key: &[u8], input: &[u8], output: &mut [u8]);
+}
+
+/// SHA-1 hash provider for legacy certificate fingerprints.
+pub trait Sha1Provider: CryptoSafe {
+    /// Compute SHA-1 hash of the input data.
+    fn sha1(&self, data: &[u8]) -> [u8; 20];
 }
 
 /// SHA-256 hash provider.
@@ -185,7 +193,12 @@ pub trait DtlsInstance: CryptoSafe {
     fn handle_timeout(&mut self, now: Instant) -> Result<(), DtlsImplError>;
 
     /// Send application data over DTLS.
-    fn send_application_data(&mut self, data: &[u8]) -> Result<(), DtlsImplError>;
+    ///
+    /// Returns the number of bytes accepted for buffering or transmission.
+    /// Accepts either the entire slice or none of it; retain unaccepted data
+    /// and retry after the handshake progresses. An empty slice returns zero
+    /// on success and does not indicate handshake readiness.
+    fn send_application_data(&mut self, data: &[u8]) -> Result<usize, DtlsImplError>;
 
     /// Return true if the instance is operating in the client role.
     fn is_active(&self) -> bool;
